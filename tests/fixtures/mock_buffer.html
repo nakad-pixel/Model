@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Buffer - Publish</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+        .header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 12px 24px; display: flex; align-items: center; }
+        .logo { font-weight: 700; color: #333; font-size: 18px; }
+        .nav { margin-left: auto; display: flex; gap: 16px; }
+        .nav a { color: #666; text-decoration: none; font-size: 14px; }
+        .main { padding: 24px; max-width: 600px; margin: 0 auto; }
+        .compose-btn {
+            background: #2c4bff; color: #fff; border: none; padding: 12px 24px;
+            border-radius: 8px; font-size: 15px; cursor: pointer;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .compose-btn:hover { background: #1a3aee; }
+        .composer {
+            background: #fff; border-radius: 12px; padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-top: 16px;
+            display: none;
+        }
+        .composer.active { display: block; }
+        .composer textarea {
+            width: 100%; min-height: 120px; border: 1px solid #e0e0e0;
+            border-radius: 8px; padding: 12px; font-size: 15px; resize: vertical;
+        }
+        .upload-area {
+            border: 2px dashed #ccc; border-radius: 8px; padding: 24px;
+            text-align: center; color: #666; margin-top: 12px;
+        }
+        .upload-area input[type="file"] { display: none; }
+        .actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+        .btn-secondary { background: #f0f0f0; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; }
+        .btn-primary { background: #2c4bff; color: #fff; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; }
+        .toast {
+            position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+            background: #1a1a1a; color: #fff; padding: 12px 24px;
+            border-radius: 8px; font-size: 14px; display: none;
+        }
+        .toast.show { display: block; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="logo">Buffer</div>
+        <nav class="nav">
+            <a href="#">Queue</a>
+            <a href="#">Analytics</a>
+            <a href="#">Settings</a>
+        </nav>
+    </header>
+    <main class="main">
+        <button class="compose-btn" aria-label="Create Post" id="compose-btn">
+            <svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="2"/></svg>
+            Create Post
+        </button>
+        <div class="composer" id="composer">
+            <textarea placeholder="What's on your mind?"></textarea>
+            <div class="upload-area">
+                <label for="file-upload">Click to upload an image</label>
+                <input type="file" id="file-upload" accept="image/*" />
+            </div>
+            <div class="actions">
+                <button class="btn-secondary">Save Draft</button>
+                <button class="btn-primary" id="schedule-btn" aria-label="Add to Queue">Add to Queue</button>
+            </div>
+        </div>
+    </main>
+    <div class="toast" id="toast">Post added to queue</div>
+    <script>
+        document.getElementById('compose-btn').addEventListener('click', () => {
+            document.getElementById('composer').classList.add('active');
+        });
+        document.getElementById('schedule-btn').addEventListener('click', () => {
+            document.getElementById('toast').classList.add('show');
+            setTimeout(() => document.getElementById('toast').classList.remove('show'), 3000);
+        });
+    </script>
+</body>
+</html>

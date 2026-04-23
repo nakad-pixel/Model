@@ -1,0 +1,36 @@
+name: "Security & Logic Testing"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test_suite:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout Code"
+        uses: actions/checkout@v4
+
+      - name: "Python Setup"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: "Install Dependencies"
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install chromium
+
+      - name: "Run Unit Tests"
+        run: pytest tests/unit/ -v --tb=short
+
+      - name: "Run Integration Tests"
+        run: pytest tests/integration/ -v --tb=short
+
+      - name: "Run E2E Tests"
+        run: pytest tests/e2e/ -v --tb=short

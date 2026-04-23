@@ -1,0 +1,87 @@
+name: "Cookie Health Check"
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM UTC
+  workflow_dispatch:
+
+jobs:
+  cookie_health:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Python Setup"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: "Install Dependencies"
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install chromium
+
+      - name: "Test Cookie Validity"
+        env:
+          GEMINI_COOKIES: ${{ secrets.GEMINI_COOKIES }}
+          SCHEDULER_COOKIES: ${{ secrets.SCHEDULER_COOKIES }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python -c "
+          import asyncio, json, os, sys
+          from playwright.async_api import async_playwright
+
+          async def check_cookies():
+              cookies_ok = True
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context()
+
+                  # Check Gemini cookies
+                  gemini_cookies = os.getenv('GEMINI_COOKIES')
+                  if gemini_cookies:
+                      try:
+                          cookies = json.loads(gemini_cookies)
+                          await context.add_cookies(cookies)
+                          page = await context.new_page()
+                          await page.goto('https://gemini.google.com/app', wait_until='domcontentloaded')
+                          if 'login' in page.url.lower():
+                              print('GEMINI_COOKIES_EXPIRED')
+                              cookies_ok = False
+                          else:
+                              print('GEMINI_COOKIES_OK')
+                          await page.close()
+                      except Exception as e:
+                          print(f'GEMINI_CHECK_ERROR: {e}')
+                          cookies_ok = False
+
+                  # Check Scheduler cookies
+                  scheduler_cookies = os.getenv('SCHEDULER_COOKIES')
+                  if scheduler_cookies:
+                      try:
+                          cookies = json.loads(scheduler_cookies)
+                          await context.add_cookies(cookies)
+                          page = await context.new_page()
+                          await page.goto('https://publish.buffer.com', wait_until='domcontentloaded')
+                          if 'login' in page.url.lower():
+                              print('SCHEDULER_COOKIES_EXPIRED')
+                              cookies_ok = False
+                          else:
+                              print('SCHEDULER_COOKIES_OK')
+                          await page.close()
+                      except Exception as e:
+                          print(f'SCHEDULER_CHECK_ERROR: {e}')
+                          cookies_ok = False
+
+                  await context.close()
+                  await browser.close()
+                  return cookies_ok
+
+          ok = asyncio.run(check_cookies())
+          sys.exit(0 if ok else 1)
+          "

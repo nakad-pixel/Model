@@ -1,0 +1,365 @@
+"""
+Project Astra - Orchestrator
+Main state machine managing the agent lifecycle from initialization to posting.
+"""
+
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
+
+from src.constants import (
+    DEFAULT_STATE,
+    EVENING_WINDOW_END,
+    EVENING_WINDOW_START,
+    MAX_CONSECUTIVE_FAILURES,
+    MAX_DAILY_POSTS,
+    MAX_GENERATION_RETRIES,
+    MIN_HOURS_BETWEEN_POSTS,
+    MORNING_WINDOW_END,
+    MORNING_WINDOW_START,
+)
+from src.engine.interaction_handler import InteractionHandler
+from src.generators.caption_generator import CaptionGenerator
+from src.generators.gemini_client import GeminiClient
+from src.generators.media_validator import MediaValidator
+from src.generators.prompt_synthesizer import PromptSynthesizer
+from src.platforms.buffer import BufferPlatform
+from src.platforms.metricool import MetricoolPlatform
+from src.platforms.social_champ import SocialChampPlatform
+from src.utils.biometric_sim import BiometricSimulator
+from src.utils.logger import logger
+from src.utils.state_manager import StateManager
+from src.utils.stealth_manager import StealthManager
+from src.utils.telemetry import Telemetry
+from src.utils.warp_manager import WarpManager
+
+
+class OrchestratorState(Enum):
+    IDLE = auto()
+    INITIALIZING = auto()
+    GENERATING_MEDIA = auto()
+    VALIDATING = auto()
+    GENERATING_CAPTION = auto()
+    POSTING = auto()
+    LOGGING = auto()
+    FINISHING = auto()
+
+
+class Orchestrator:
+    """
+    The brain of Project Astra. Manages state transitions,
+    circuit breaker logic, and coordinates all subsystems.
+    """
+
+    def __init__(self) -> None:
+        self.state = OrchestratorState.IDLE
+        self.state_manager = StateManager()
+        self.telemetry = Telemetry()
+        self.warp = WarpManager()
+        self.stealth: Optional[StealthManager] = None
+        self.page = None
+
+        # Generators
+        self.prompt_synthesizer: Optional[PromptSynthesizer] = None
+        self.gemini_client: Optional[GeminiClient] = None
+        self.media_validator = MediaValidator()
+        self.caption_generator = CaptionGenerator()
+
+        # Platforms
+        self.buffer: Optional[BufferPlatform] = None
+        self.metricool: Optional[MetricoolPlatform] = None
+        self.social_champ: Optional[SocialChampPlatform] = None
+
+        # Tracking
+        self.current_prompt: Optional[str] = None
+        self.image_path: Optional[str] = None
+        self.caption: Optional[str] = None
+        self.phase_error: Optional[str] = None
+
+    async def run(self) -> int:
+        """
+        Main orchestrator loop. Returns exit code (0 for success/no-op, 1 for failure).
+        """
+        try:
+            # Phase: INITIALIZING
+            await self._transition_to(OrchestratorState.INITIALIZING)
+            if not await self._initialize():
+                logger.info("Orchestrator exiting: initialization gate prevented run.")
+                return 0
+
+            # Phase: GENERATING_MEDIA
+            await self._transition_to(OrchestratorState.GENERATING_MEDIA)
+            if not await self._generate_media():
+                await self._handle_failure("GENERATING_MEDIA")
+                return 1
+
+            # Phase: VALIDATING
+            await self._transition_to(OrchestratorState.VALIDATING)
+            if not await self._validate_media():
+                await self._handle_failure("VALIDATING")
+                return 1
+
+            # Phase: GENERATING_CAPTION
+            await self._transition_to(OrchestratorState.GENERATING_CAPTION)
+            if not await self._generate_caption():
+                await self._handle_failure("GENERATING_CAPTION")
+                return 1
+
+            # Phase: POSTING
+            await self._transition_to(OrchestratorState.POSTING)
+            if not await self._post_content():
+                await self._handle_failure("POSTING")
+                return 1
+
+            # Phase: LOGGING
+            await self._transition_to(OrchestratorState.LOGGING)
+            await self._log_success()
+
+            # Phase: FINISHING
+            await self._transition_to(OrchestratorState.FINISHING)
+            await self._cleanup()
+
+            logger.info("Orchestrator completed successfully.")
+            return 0
+
+        except Exception as exc:
+            logger.exception("Unhandled exception in orchestrator")
+            await self._handle_failure(f"UNHANDLED_EXCEPTION: {exc}")
+            return 1
+
+    async def _initialize(self) -> bool:
+        """
+        Initialize state, check scheduling gates, connect WARP, launch browser.
+        Returns False if execution should be skipped.
+        """
+        # Load and reset daily counters if needed
+        state = self.state_manager.reset_daily_counters_if_needed()
+
+        # Gate 1: Check consecutive failures (circuit breaker)
+        consecutive_failures = state.get("consecutive_failures", 0)
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            logger.error(f"Circuit breaker active: {consecutive_failures} consecutive failures.")
+            await self.telemetry.send_failure(
+                "INITIALIZING",
+                f"Circuit breaker tripped: {consecutive_failures} consecutive failures.",
+            )
+            return False
+
+        # Gate 2: Check posting windows (IST)
+        now_ist = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+        hour = now_ist.hour + now_ist.minute / 60
+
+        in_morning_window = MORNING_WINDOW_START <= hour < MORNING_WINDOW_END
+        in_evening_window = EVENING_WINDOW_START <= hour < EVENING_WINDOW_END
+
+        if not (in_morning_window or in_evening_window):
+            logger.info(
+                f"Outside posting windows (IST hour={hour:.2f}). Exiting gracefully."
+            )
+            return False
+
+        time_of_day = "morning" if in_morning_window else "evening"
+
+        # Gate 3: Minimum hours between posts
+        last_ts = state.get("last_execution_timestamp_utc")
+        if last_ts:
+            last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+            if hours_since < MIN_HOURS_BETWEEN_POSTS:
+                logger.info(f"Only {hours_since:.1f}h since last post. Min: {MIN_HOURS_BETWEEN_POSTS}h.")
+                return False
+
+        # Gate 4: Daily post limit
+        daily_count = state.get("daily_post_count", 0)
+        if daily_count >= MAX_DAILY_POSTS:
+            logger.info(f"Daily post limit reached: {daily_count}/{MAX_DAILY_POSTS}")
+            return False
+
+        # Initialize components
+        self.prompt_synthesizer = PromptSynthesizer(
+            last_theme_used=state.get("last_theme_used")
+        )
+
+        # Connect WARP (Layer 1)
+        if os.getenv("SKIP_WARP") != "true":
+            await self.warp.install()
+            await self.warp.register()
+            if not await self.warp.connect():
+                logger.warning("WARP connection failed. Proceeding without WARP.")
+
+        # Launch stealth browser (Layers 2-3)
+        self.stealth = StealthManager()
+        self.page = await self.stealth.launch(headless=os.getenv("HEADED") != "true")
+
+        # Inject cookies (Layer 5)
+        gemini_cookies = os.getenv("GEMINI_COOKIES")
+        scheduler_cookies = os.getenv("SCHEDULER_COOKIES")
+
+        if gemini_cookies:
+            await self.stealth.inject_cookies(gemini_cookies, domain_filter="google.com")
+        if scheduler_cookies:
+            # Try both buffer and metricool domains
+            await self.stealth.inject_cookies(scheduler_cookies)
+
+        # Initialize subsystems
+        interaction = InteractionHandler(self.page)
+        self.gemini_client = GeminiClient(self.page, interaction)
+        self.buffer = BufferPlatform(self.page, interaction)
+        self.metricool = MetricoolPlatform(self.page, interaction)
+        self.social_champ = SocialChampPlatform(self.page, interaction)
+
+        logger.info(f"Initialization complete. Time of day: {time_of_day}")
+        return True
+
+    async def _generate_media(self) -> bool:
+        """Generate image via Gemini with retry logic."""
+        if not self.prompt_synthesizer or not self.gemini_client:
+            return False
+
+        state = self.state_manager.load()
+        generation_attempt = state.get("generation_attempt", 0)
+
+        for attempt in range(MAX_GENERATION_RETRIES + 1):
+            self.current_prompt = self.prompt_synthesizer.get_daily_prompt()
+            logger.info(f"Generation attempt {attempt + 1}: {self.current_prompt[:100]}...")
+
+            self.image_path = await self.gemini_client.generate_image(self.current_prompt)
+
+            if self.image_path and Path(self.image_path).exists():
+                self.state_manager.update_and_save({"generation_attempt": 0})
+                return True
+
+            generation_attempt += 1
+            self.state_manager.update_and_save({"generation_attempt": generation_attempt})
+            logger.warning(f"Generation attempt {attempt + 1} failed. Retrying...")
+            await asyncio.sleep(5)
+
+        logger.error("All generation attempts exhausted.")
+        return False
+
+    async def _validate_media(self) -> bool:
+        """Validate generated image quality."""
+        if not self.image_path:
+            return False
+
+        is_valid, errors = self.media_validator.validate(self.image_path)
+        if is_valid:
+            # Move to exports
+            export_path = f"media/exports/{Path(self.image_path).name}"
+            Path(export_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.image_path).rename(export_path)
+            self.image_path = export_path
+            return True
+
+        logger.error(f"Media validation failed: {errors}")
+        return False
+
+    async def _generate_caption(self) -> bool:
+        """Generate caption using GLM-4.7."""
+        if not self.current_prompt:
+            return False
+
+        time_of_day = self.prompt_synthesizer._detect_time_of_day() if self.prompt_synthesizer else "morning"
+        curiosity = time_of_day == "evening"
+
+        self.caption = await self.caption_generator.generate(
+            context=self.current_prompt,
+            time_of_day=time_of_day,
+            curiosity_gap=curiosity,
+        )
+
+        if self.caption:
+            logger.info(f"Caption generated: {self.caption[:100]}...")
+            return True
+
+        logger.error("Caption generation returned None.")
+        return False
+
+    async def _post_content(self) -> bool:
+        """Post content to available schedulers."""
+        if not self.image_path or not self.caption:
+            return False
+
+        # Try platforms in order of preference
+        platforms = [
+            ("buffer", self.buffer),
+            ("metricool", self.metricool),
+            ("social_champ", self.social_champ),
+        ]
+
+        for name, platform in platforms:
+            if platform is None:
+                continue
+            try:
+                logger.info(f"Attempting to post via {name}...")
+                success = await platform.create_post(self.image_path, self.caption)
+                if success:
+                    logger.info(f"Posted successfully via {name}.")
+                    await self.telemetry.send_success(
+                        context=f"Platform: {name} | Prompt: {self.current_prompt[:80]}...",
+                        image_path=self.image_path,
+                    )
+                    return True
+            except Exception as exc:
+                logger.error(f"Platform {name} error: {exc}")
+                # Check for auth failure
+                if "401" in str(exc) or "403" in str(exc) or "login" in str(exc).lower():
+                    await self.telemetry.send_cookie_expired(name)
+
+        logger.error("All platforms failed to accept the post.")
+        return False
+
+    async def _log_success(self) -> None:
+        """Update state log with success metrics."""
+        now = datetime.now(timezone.utc).isoformat()
+        updates = {
+            "last_execution_timestamp_utc": now,
+            "daily_post_count": self.state_manager.load().get("daily_post_count", 0) + 1,
+            "last_theme_used": self.current_prompt,
+            "consecutive_failures": 0,
+            "total_posts_all_time": self.state_manager.load().get("total_posts_all_time", 0) + 1,
+        }
+        self.state_manager.update_and_save(updates)
+        logger.info("State log updated with success.")
+
+    async def _handle_failure(self, phase: str) -> None:
+        """Handle failure: increment counter, capture state, alert."""
+        self.phase_error = phase
+        state = self.state_manager.load()
+        consecutive = state.get("consecutive_failures", 0) + 1
+        self.state_manager.update_and_save({"consecutive_failures": consecutive})
+
+        screenshot_path = None
+        if self.stealth:
+            screenshot_path = await self.stealth.capture_error_state()
+
+        await self.telemetry.send_failure(phase, f"Failure in phase {phase}", screenshot_path)
+        logger.error(f"Orchestrator failure in phase: {phase}. Consecutive: {consecutive}")
+
+    async def _cleanup(self) -> None:
+        """Graceful shutdown: close browser, disconnect WARP."""
+        if self.stealth:
+            await self.stealth.close()
+        await self.warp.disconnect()
+        logger.info("Cleanup complete.")
+
+    async def _transition_to(self, new_state: OrchestratorState) -> None:
+        """Log state transitions."""
+        logger.info(f"State transition: {self.state.name} -> {new_state.name}")
+        self.state = new_state
+
+
+def main() -> int:
+    """Synchronous entry point for orchestrator."""
+    orchestrator = Orchestrator()
+    return asyncio.run(orchestrator.run())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
