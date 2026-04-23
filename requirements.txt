@@ -1,0 +1,38 @@
+# Project Astra: Sovereign AI Influencer Agent
+# Python 3.11.x required
+# Zero-Cost Infrastructure Stack
+
+# Core Automation & Stealth (Layer 3)
+rebrowser-playwright>=1.40.0
+
+# Stealth Plugins (Layer 2)
+playwright-extra>=0.4.0
+puppeteer-extra-plugin-stealth>=2.11.0
+
+# Async HTTP Client for GLM-4.7 API
+httpx[http2]>=0.27.0
+
+# Image Processing (Layer 4 Validation)
+Pillow>=10.0.0
+
+# Structured Data Validation
+pydantic>=2.5.0
+
+# Logging
+loguru>=0.7.0
+
+# Environment & Configuration
+python-dotenv>=1.0.0
+
+# Testing Framework
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-playwright>=0.4.0
+
+# Development Tools
+black>=23.0.0
+ruff>=0.1.0
+mypy>=1.7.0
+
+# Optional: Image hashing for duplicate detection
+imagehash>=4.3.0

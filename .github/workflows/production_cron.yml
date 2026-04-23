@@ -1,0 +1,71 @@
+name: "Astra Core Lifecycle"
+
+on:
+  schedule:
+    - cron: '15 3,9,15,21 * * *'  # Every 6 hours with 15-min offset
+  workflow_dispatch:
+
+concurrency:
+  group: astra-production
+  cancel-in-progress: false
+
+jobs:
+  operational_run:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: "Clone Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Layer 1: Network Obfuscation (WARP)"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gnupg
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+          warp-cli --accept-tos register
+          warp-cli --accept-tos set-mode warp
+          warp-cli --accept-tos connect
+          sleep 5
+          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep "warp=on"
+
+      - name: "Environment Setup: Python & Dependencies"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: "Environment Setup: Playwright & Stealth"
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install chromium
+
+      - name: "State Recovery: Fetch Previous Log"
+        uses: actions/download-artifact@v4
+        with:
+          name: astra-state-data
+          path: ./data/
+        continue-on-error: true
+
+      - name: "Execution: The Orchestrator"
+        env:
+          GEMINI_COOKIES: ${{ secrets.GEMINI_COOKIES }}
+          SCHEDULER_COOKIES: ${{ secrets.SCHEDULER_COOKIES }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python -m src
+
+      - name: "Persistence: Upload State & Artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astra-state-data
+          path: |
+            data/state_log.json
+            media/error_logs/
+            media/exports/
+          retention-days: 7

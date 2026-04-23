@@ -1,0 +1,27 @@
+name: "Setup Cloudflare WARP"
+description: "Installs and connects Cloudflare WARP for network obfuscation"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Install WARP"
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq curl gnupg
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
+        sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+
+    - name: "Register and Connect"
+      shell: bash
+      run: |
+        warp-cli --accept-tos register
+        warp-cli --accept-tos set-mode warp
+        warp-cli --accept-tos connect
+        sleep 5
+
+    - name: "Verify Connection"
+      shell: bash
+      run: |
+        curl -s https://www.cloudflare.com/cdn-cgi/trace | grep "warp=on"
