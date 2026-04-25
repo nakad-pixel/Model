@@ -4,7 +4,6 @@ Main state machine managing the agent lifecycle from initialization to posting.
 """
 
 import asyncio
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -29,11 +28,15 @@ from src.generators.caption_generator import CaptionGenerator
 from src.generators.gemini_client import GeminiClient
 from src.generators.media_validator import MediaValidator
 from src.generators.prompt_synthesizer import PromptSynthesizer
+from src.generators.video_client import VideoClient
 from src.platforms.buffer import BufferPlatform
+from src.platforms.clipchamp import ClipchampPlatform
 from src.platforms.metricool import MetricoolPlatform
 from src.platforms.social_champ import SocialChampPlatform
 from src.utils.biometric_sim import BiometricSimulator
+from src.utils.cost_tracker import CostTracker
 from src.utils.logger import logger
+from src.utils.network_healer import NetworkHealer
 from src.utils.state_manager import StateManager
 from src.utils.stealth_manager import StealthManager
 from src.utils.telemetry import Telemetry
@@ -62,12 +65,15 @@ class Orchestrator:
         self.state_manager = StateManager()
         self.telemetry = Telemetry()
         self.warp = WarpManager()
+        self.network_healer = NetworkHealer(self.warp)
         self.stealth: Optional[StealthManager] = None
         self.page = None
+        self.cost_tracker = CostTracker()
 
         # Generators
         self.prompt_synthesizer: Optional[PromptSynthesizer] = None
         self.gemini_client: Optional[GeminiClient] = None
+        self.video_client: Optional[VideoClient] = None
         self.media_validator = MediaValidator()
         self.caption_generator = CaptionGenerator()
 
@@ -75,12 +81,14 @@ class Orchestrator:
         self.buffer: Optional[BufferPlatform] = None
         self.metricool: Optional[MetricoolPlatform] = None
         self.social_champ: Optional[SocialChampPlatform] = None
+        self.clipchamp: Optional[ClipchampPlatform] = None
 
         # Tracking
         self.current_prompt: Optional[str] = None
-        self.image_path: Optional[str] = None
+        self.media_path: Optional[str] = None
         self.caption: Optional[str] = None
         self.phase_error: Optional[str] = None
+        self.is_video: bool = False
 
     async def run(self) -> int:
         """
@@ -193,6 +201,18 @@ class Orchestrator:
             if not await self.warp.connect():
                 logger.warning("WARP connection failed. Proceeding without WARP.")
 
+        # Network self-healing check
+        healthy = await self.network_healer.health_check()
+        if not healthy[0]:
+            healed = await self.network_healer.heal_if_needed()
+            if not healed:
+                logger.error("Network self-healing failed. Aborting.")
+                await self.telemetry.send_failure(
+                    "INITIALIZING",
+                    "Network self-healing failed after WARP reconnect.",
+                )
+                return False
+
         # Launch stealth browser (Layers 2-3)
         self.stealth = StealthManager()
         self.page = await self.stealth.launch(headless=os.getenv("HEADED") != "true")
@@ -200,26 +220,42 @@ class Orchestrator:
         # Inject cookies (Layer 5)
         gemini_cookies = os.getenv("GEMINI_COOKIES")
         scheduler_cookies = os.getenv("SCHEDULER_COOKIES")
+        wan_cookies = os.getenv("WAN_COOKIES")
+        kie_cookies = os.getenv("KIE_COOKIES")
 
         if gemini_cookies:
             await self.stealth.inject_cookies(gemini_cookies, domain_filter="google.com")
         if scheduler_cookies:
-            # Try both buffer and metricool domains
             await self.stealth.inject_cookies(scheduler_cookies)
+        if wan_cookies:
+            await self.stealth.inject_cookies(wan_cookies, domain_filter="wan.video")
+        if kie_cookies:
+            await self.stealth.inject_cookies(kie_cookies, domain_filter="kie.ai")
 
         # Initialize subsystems
         interaction = InteractionHandler(self.page)
         self.gemini_client = GeminiClient(self.page, interaction)
+        self.video_client = VideoClient(
+            self.page,
+            interaction,
+            network_healer=self.network_healer,
+            telemetry=self.telemetry,
+            cost_tracker=self.cost_tracker,
+        )
         self.buffer = BufferPlatform(self.page, interaction)
         self.metricool = MetricoolPlatform(self.page, interaction)
         self.social_champ = SocialChampPlatform(self.page, interaction)
+        self.clipchamp = ClipchampPlatform(self.page, interaction)
 
         logger.info(f"Initialization complete. Time of day: {time_of_day}")
         return True
 
     async def _generate_media(self) -> bool:
-        """Generate image via Gemini with retry logic."""
-        if not self.prompt_synthesizer or not self.gemini_client:
+        """
+        Generate image or video based on AI content decision.
+        AI decides when to use video vs static image.
+        """
+        if not self.prompt_synthesizer:
             return False
 
         state = self.state_manager.load()
@@ -229,9 +265,28 @@ class Orchestrator:
             self.current_prompt = self.prompt_synthesizer.get_daily_prompt()
             logger.info(f"Generation attempt {attempt + 1}: {self.current_prompt[:100]}...")
 
-            self.image_path = await self.gemini_client.generate_image(self.current_prompt)
+            # AI content decision: analyze prompt for video suitability
+            analysis = await self.video_client.analyze_content_for_video(self.current_prompt)
+            use_video = analysis.get("use_video", False)
+            motion_score = analysis.get("motion_score", 0.0)
+            cinematic_score = analysis.get("cinematic_score", 0.0)
 
-            if self.image_path and Path(self.image_path).exists():
+            logger.info(
+                f"Content analysis: use_video={use_video}, motion={motion_score:.2f}, cinematic={cinematic_score:.2f}"
+            )
+
+            if use_video:
+                self.is_video = True
+                self.media_path = await self.video_client.generate_video(
+                    self.current_prompt,
+                    motion_score=motion_score,
+                    cinematic_score=cinematic_score,
+                )
+            else:
+                self.is_video = False
+                self.media_path = await self.gemini_client.generate_image(self.current_prompt)
+
+            if self.media_path and Path(self.media_path).exists():
                 self.state_manager.update_and_save({"generation_attempt": 0})
                 return True
 
@@ -244,17 +299,29 @@ class Orchestrator:
         return False
 
     async def _validate_media(self) -> bool:
-        """Validate generated image quality."""
-        if not self.image_path:
+        """Validate generated media quality."""
+        if not self.media_path:
             return False
 
-        is_valid, errors = self.media_validator.validate(self.image_path)
+        # For video, do basic file validation
+        if self.is_video:
+            path = Path(self.media_path)
+            if path.exists() and path.stat().st_size > 50_000:
+                export_path = f"media/exports/{path.name}"
+                Path(export_path).parent.mkdir(parents=True, exist_ok=True)
+                path.rename(export_path)
+                self.media_path = export_path
+                logger.info(f"Video validation passed: {self.media_path}")
+                return True
+            logger.error("Video validation failed: file too small or missing.")
+            return False
+
+        is_valid, errors = self.media_validator.validate(self.media_path)
         if is_valid:
-            # Move to exports
-            export_path = f"media/exports/{Path(self.image_path).name}"
+            export_path = f"media/exports/{Path(self.media_path).name}"
             Path(export_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(self.image_path).rename(export_path)
-            self.image_path = export_path
+            Path(self.media_path).rename(export_path)
+            self.media_path = export_path
             return True
 
         logger.error(f"Media validation failed: {errors}")
@@ -283,32 +350,55 @@ class Orchestrator:
 
     async def _post_content(self) -> bool:
         """Post content to available schedulers."""
-        if not self.image_path or not self.caption:
+        if not self.media_path or not self.caption:
             return False
 
         # Try platforms in order of preference
-        platforms = [
-            ("buffer", self.buffer),
-            ("metricool", self.metricool),
-            ("social_champ", self.social_champ),
-        ]
+        if self.is_video:
+            platforms = [
+                ("buffer", self.buffer),
+                ("metricool", self.metricool),
+                ("clipchamp", self.clipchamp),
+                ("social_champ", self.social_champ),
+            ]
+        else:
+            platforms = [
+                ("buffer", self.buffer),
+                ("metricool", self.metricool),
+                ("social_champ", self.social_champ),
+                ("clipchamp", self.clipchamp),
+            ]
 
         for name, platform in platforms:
             if platform is None:
                 continue
             try:
                 logger.info(f"Attempting to post via {name}...")
-                success = await platform.create_post(self.image_path, self.caption)
+
+                # Platform health check before posting
+                if hasattr(platform, "BUFFER_URL"):
+                    healthy = await self.network_healer.platform_health_check(platform.BUFFER_URL)
+                elif hasattr(platform, "METRICOOL_URL"):
+                    healthy = await self.network_healer.platform_health_check(platform.METRICOOL_URL)
+                elif hasattr(platform, "CLIPCHAMP_URL"):
+                    healthy = await self.network_healer.platform_health_check(platform.CLIPCHAMP_URL)
+                else:
+                    healthy = True
+
+                if not healthy:
+                    logger.warning(f"Skipping {name}: platform health check failed.")
+                    continue
+
+                success = await platform.create_post(self.media_path, self.caption)
                 if success:
                     logger.info(f"Posted successfully via {name}.")
                     await self.telemetry.send_success(
-                        context=f"Platform: {name} | Prompt: {self.current_prompt[:80]}...",
-                        image_path=self.image_path,
+                        context=f"Platform: {name} | Type: {'video' if self.is_video else 'image'} | Prompt: {self.current_prompt[:80]}...",
+                        image_path=None if self.is_video else self.media_path,
                     )
                     return True
             except Exception as exc:
                 logger.error(f"Platform {name} error: {exc}")
-                # Check for auth failure
                 if "401" in str(exc) or "403" in str(exc) or "login" in str(exc).lower():
                     await self.telemetry.send_cookie_expired(name)
 
@@ -326,6 +416,12 @@ class Orchestrator:
             "total_posts_all_time": self.state_manager.load().get("total_posts_all_time", 0) + 1,
         }
         self.state_manager.update_and_save(updates)
+
+        # Check cost tracker alerts
+        alert_msg = self.cost_tracker.check_and_alert()
+        if alert_msg:
+            await self.telemetry.send_failure("COST_TRACKER", alert_msg)
+
         logger.info("State log updated with success.")
 
     async def _handle_failure(self, phase: str) -> None:
@@ -342,6 +438,15 @@ class Orchestrator:
         await self.telemetry.send_failure(phase, f"Failure in phase {phase}", screenshot_path)
         logger.error(f"Orchestrator failure in phase: {phase}. Consecutive: {consecutive}")
 
+        # Circuit breaker: same phase fails 3x -> go dark + alert
+        if consecutive >= MAX_CONSECUTIVE_FAILURES:
+            logger.critical("Circuit breaker tripped. Agent going dark.")
+            await self.telemetry.send_failure(
+                "CIRCUIT_BREAKER",
+                f"Agent going dark after {consecutive} consecutive failures.",
+                screenshot_path,
+            )
+
     async def _cleanup(self) -> None:
         """Graceful shutdown: close browser, disconnect WARP."""
         if self.stealth:
@@ -350,9 +455,11 @@ class Orchestrator:
         logger.info("Cleanup complete.")
 
     async def _transition_to(self, new_state: OrchestratorState) -> None:
-        """Log state transitions."""
+        """Log state transitions and persist phase-level state."""
         logger.info(f"State transition: {self.state.name} -> {new_state.name}")
         self.state = new_state
+        # Phase-level state saving for recovery
+        self.state_manager.update_and_save({"current_phase": new_state.name})
 
 
 def main() -> int:

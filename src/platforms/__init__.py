@@ -1,4 +1,4 @@
 """
 Project Astra - Platform Automation
-Buffer, Metricool, and Social Champ scheduler integrations.
+Buffer, Metricool, Social Champ, and Clipchamp scheduler integrations.
 """
