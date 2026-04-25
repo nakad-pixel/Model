@@ -10,8 +10,6 @@ setup(
     package_dir={"": "src"},
     install_requires=[
         "rebrowser-playwright>=1.40.0",
-        "playwright-extra>=0.4.0",
-        "puppeteer-extra-plugin-stealth>=2.11.0",
         "httpx[http2]>=0.27.0",
         "Pillow>=10.0.0",
         "pydantic>=2.5.0",
