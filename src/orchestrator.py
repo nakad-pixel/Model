@@ -1,6 +1,7 @@
 """
 Project Astra - Orchestrator
 Main state machine managing the agent lifecycle from initialization to posting.
+Multi-persona architecture with reference consistency verification.
 """
 
 import asyncio
@@ -13,6 +14,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from src.constants import (
+    DEFAULT_PERSONA_ID,
     DEFAULT_STATE,
     EVENING_WINDOW_END,
     EVENING_WINDOW_START,
@@ -29,6 +31,7 @@ from src.generators.gemini_client import GeminiClient
 from src.generators.media_validator import MediaValidator
 from src.generators.prompt_synthesizer import PromptSynthesizer
 from src.generators.video_client import VideoClient
+from src.persona_manager import PersonaManager
 from src.platforms.buffer import BufferPlatform
 from src.platforms.clipchamp import ClipchampPlatform
 from src.platforms.metricool import MetricoolPlatform
@@ -46,6 +49,8 @@ from src.utils.warp_manager import WarpManager
 class OrchestratorState(Enum):
     IDLE = auto()
     INITIALIZING = auto()
+    LOADING_PERSONA = auto()
+    GENERATING_REFERENCE = auto()
     GENERATING_MEDIA = auto()
     VALIDATING = auto()
     GENERATING_CAPTION = auto()
@@ -57,18 +62,20 @@ class OrchestratorState(Enum):
 class Orchestrator:
     """
     The brain of Project Astra. Manages state transitions,
-    circuit breaker logic, and coordinates all subsystems.
+    circuit breaker logic, persona isolation, and coordinates all subsystems.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, persona_id: Optional[str] = None) -> None:
+        self.persona_id = persona_id or os.getenv("PERSONA_ID", DEFAULT_PERSONA_ID)
         self.state = OrchestratorState.IDLE
-        self.state_manager = StateManager()
+        self.state_manager = StateManager(persona_id=self.persona_id)
         self.telemetry = Telemetry()
         self.warp = WarpManager()
         self.network_healer = NetworkHealer(self.warp)
         self.stealth: Optional[StealthManager] = None
         self.page = None
         self.cost_tracker = CostTracker()
+        self.persona_manager = PersonaManager(self.persona_id)
 
         # Generators
         self.prompt_synthesizer: Optional[PromptSynthesizer] = None
@@ -100,6 +107,12 @@ class Orchestrator:
             if not await self._initialize():
                 logger.info("Orchestrator exiting: initialization gate prevented run.")
                 return 0
+
+            # Phase: LOADING_PERSONA
+            await self._transition_to(OrchestratorState.LOADING_PERSONA)
+            if not await self._load_persona():
+                await self._handle_failure("LOADING_PERSONA")
+                return 1
 
             # Phase: GENERATING_MEDIA
             await self._transition_to(OrchestratorState.GENERATING_MEDIA)
@@ -217,20 +230,20 @@ class Orchestrator:
         self.stealth = StealthManager()
         self.page = await self.stealth.launch(headless=os.getenv("HEADED") != "true")
 
-        # Inject cookies (Layer 5)
-        gemini_cookies = os.getenv("GEMINI_COOKIES")
-        scheduler_cookies = os.getenv("SCHEDULER_COOKIES")
-        wan_cookies = os.getenv("WAN_COOKIES")
-        kie_cookies = os.getenv("KIE_COOKIES")
-
-        if gemini_cookies:
-            await self.stealth.inject_cookies(gemini_cookies, domain_filter="google.com")
-        if scheduler_cookies:
-            await self.stealth.inject_cookies(scheduler_cookies)
-        if wan_cookies:
-            await self.stealth.inject_cookies(wan_cookies, domain_filter="wan.video")
-        if kie_cookies:
-            await self.stealth.inject_cookies(kie_cookies, domain_filter="kie.ai")
+        # Inject per-persona cookies (Layer 5)
+        cookie_mgr = self.persona_manager.cookie_manager
+        for platform in cookie_mgr.all_platforms():
+            raw_cookies = cookie_mgr.load_cookies(platform)
+            if raw_cookies:
+                domain_filter = None
+                if platform == "gemini":
+                    domain_filter = "google.com"
+                elif platform in ("wan", "kie", "buffer", "metricool"):
+                    domain_filter = f"{platform}"
+                try:
+                    await self.stealth.inject_cookies(raw_cookies, domain_filter=domain_filter)
+                except Exception as exc:
+                    logger.warning(f"Cookie injection failed for {platform}: {exc}")
 
         # Initialize subsystems
         interaction = InteractionHandler(self.page)
@@ -247,13 +260,39 @@ class Orchestrator:
         self.social_champ = SocialChampPlatform(self.page, interaction)
         self.clipchamp = ClipchampPlatform(self.page, interaction)
 
-        logger.info(f"Initialization complete. Time of day: {time_of_day}")
+        # Check cookie health and alert if needed
+        cookie_alerts = cookie_mgr.should_alert()
+        if cookie_alerts:
+            for platform in cookie_alerts:
+                await self.telemetry.send_cookie_expired(platform)
+
+        logger.info(f"Initialization complete for persona '{self.persona_id}'. Time of day: {time_of_day}")
+        return True
+
+    async def _load_persona(self) -> bool:
+        """
+        Load persona configuration and verify canonical references exist.
+        If references are missing, attempt to set up from candidates.
+        """
+        ref_mgr = self.persona_manager.reference_manager
+        if not ref_mgr.all_canonicals_exist():
+            logger.warning(
+                f"Persona '{self.persona_id}' missing canonical references. "
+                "Please provide 5 reference images in data/{persona_id}/reference/"
+            )
+            # Gracefully continue without references; verification will be skipped
+        else:
+            logger.info(f"Persona '{self.persona_id}' canonical references verified.")
+            # Ensure embeddings and hashes are initialized
+            canonicals = ref_mgr.get_canonical_paths()
+            self.persona_manager.setup_references()
         return True
 
     async def _generate_media(self) -> bool:
         """
         Generate image or video based on AI content decision.
         AI decides when to use video vs static image.
+        Injects reference persona descriptors for consistency.
         """
         if not self.prompt_synthesizer:
             return False
@@ -262,7 +301,9 @@ class Orchestrator:
         generation_attempt = state.get("generation_attempt", 0)
 
         for attempt in range(MAX_GENERATION_RETRIES + 1):
-            self.current_prompt = self.prompt_synthesizer.get_daily_prompt()
+            base_prompt = self.prompt_synthesizer.get_daily_prompt()
+            # Inject reference context for persona consistency
+            self.current_prompt = self.persona_manager.inject_prompt_with_references(base_prompt)
             logger.info(f"Generation attempt {attempt + 1}: {self.current_prompt[:100]}...")
 
             # AI content decision: analyze prompt for video suitability
@@ -299,7 +340,7 @@ class Orchestrator:
         return False
 
     async def _validate_media(self) -> bool:
-        """Validate generated media quality."""
+        """Validate generated media quality and persona consistency."""
         if not self.media_path:
             return False
 
@@ -316,16 +357,32 @@ class Orchestrator:
             logger.error("Video validation failed: file too small or missing.")
             return False
 
+        # Image validation pipeline
         is_valid, errors = self.media_validator.validate(self.media_path)
-        if is_valid:
-            export_path = f"media/exports/{Path(self.media_path).name}"
-            Path(export_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(self.media_path).rename(export_path)
-            self.media_path = export_path
-            return True
+        if not is_valid:
+            logger.error(f"Media validation failed: {errors}")
+            return False
 
-        logger.error(f"Media validation failed: {errors}")
-        return False
+        # Persona consistency verification (face + pHash)
+        ref_mgr = self.persona_manager.reference_manager
+        if ref_mgr.all_canonicals_exist():
+            verify_result = self.persona_manager.verify_media(self.media_path)
+            if not verify_result["overall_pass"]:
+                logger.error(
+                    f"Persona consistency failed: face={verify_result['face_verified']}, "
+                    f"phash={verify_result['phash_acceptable']}"
+                )
+                return False
+            logger.info(
+                f"Persona consistency passed: similarity={verify_result['face_similarity']:.3f}, "
+                f"phash_dist={verify_result['phash_distance']}"
+            )
+
+        export_path = f"media/exports/{Path(self.media_path).name}"
+        Path(export_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.media_path).rename(export_path)
+        self.media_path = export_path
+        return True
 
     async def _generate_caption(self) -> bool:
         """Generate caption using GLM-4.7."""
@@ -393,7 +450,7 @@ class Orchestrator:
                 if success:
                     logger.info(f"Posted successfully via {name}.")
                     await self.telemetry.send_success(
-                        context=f"Platform: {name} | Type: {'video' if self.is_video else 'image'} | Prompt: {self.current_prompt[:80]}...",
+                        context=f"Persona: {self.persona_id} | Platform: {name} | Type: {'video' if self.is_video else 'image'} | Prompt: {self.current_prompt[:80]}...",
                         image_path=None if self.is_video else self.media_path,
                     )
                     return True

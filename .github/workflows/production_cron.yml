@@ -4,9 +4,14 @@ on:
   schedule:
     - cron: '15 3,9,15,21 * * *'  # Every 6 hours with 15-min offset
   workflow_dispatch:
+    inputs:
+      persona_id:
+        description: 'Persona ID to run (e.g., astra, nova)'
+        required: false
+        default: 'astra'
 
 concurrency:
-  group: astra-production
+  group: astra-production-${{ github.event.inputs.persona_id || 'astra' }}
   cancel-in-progress: false
 
 jobs:
@@ -42,20 +47,24 @@ jobs:
       - name: "Environment Setup: Playwright & Stealth"
         run: |
           pip install -r requirements.txt
-          python -m playwright install chromium
+          python -m patchright install chromium
 
       - name: "State Recovery: Fetch Previous Log"
         uses: actions/download-artifact@v4
         with:
-          name: astra-state-data
+          name: astra-state-data-${{ github.event.inputs.persona_id || 'astra' }}
           path: ./data/
         continue-on-error: true
 
       - name: "Execution: The Orchestrator"
         env:
-          GEMINI_COOKIES: ${{ secrets.GEMINI_COOKIES }}
-          SCHEDULER_COOKIES: ${{ secrets.SCHEDULER_COOKIES }}
-          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          PERSONA_ID: ${{ github.event.inputs.persona_id || 'astra' }}
+          GEMINI_COOKIES_ASTRA: ${{ secrets.GEMINI_COOKIES_ASTRA }}
+          WAN_COOKIES_ASTRA: ${{ secrets.WAN_COOKIES_ASTRA }}
+          KIE_COOKIES_ASTRA: ${{ secrets.KIE_COOKIES_ASTRA }}
+          BUFFER_COOKIES_ASTRA: ${{ secrets.BUFFER_COOKIES_ASTRA }}
+          METRICOOL_COOKIES_ASTRA: ${{ secrets.METRICOOL_COOKIES_ASTRA }}
+          GLM_API_KEY_ASTRA: ${{ secrets.GLM_API_KEY_ASTRA }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: python -m src
 
@@ -63,9 +72,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: astra-state-data
+          name: astra-state-data-${{ github.event.inputs.persona_id || 'astra' }}
           path: |
-            data/state_log.json
+            data/
             media/error_logs/
             media/exports/
           retention-days: 7

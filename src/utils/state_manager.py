@@ -15,8 +15,13 @@ from src.utils.logger import logger
 class StateManager:
     """Atomic handling of the agent's memory and execution state."""
 
-    def __init__(self, path: str = "data/state_log.json") -> None:
-        self.path = Path(path)
+    def __init__(self, path: str = "", persona_id: str = "") -> None:
+        if path:
+            self.path = Path(path)
+        elif persona_id:
+            self.path = Path(f"data/{persona_id}/state_log.json")
+        else:
+            self.path = Path("data/state_log.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> Dict[str, Any]:

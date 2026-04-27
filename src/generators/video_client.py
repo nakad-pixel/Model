@@ -1,6 +1,7 @@
 """
 Project Astra - Video Client
 Unified video generation client with platform adapters and fallback chain.
+AI-driven platform selection: Veo 3 (cinematic) > Wan 2.2 (motion) > Kie.ai (fallback).
 """
 
 import asyncio
@@ -8,7 +9,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import Page
+try:
+    from patchright.async_api import Page
+except Exception:  # pragma: no cover
+    from playwright.async_api import Page
 
 from src.engine.interaction_handler import InteractionHandler
 from src.generators.kie_adapter import KieAdapter
@@ -23,8 +27,11 @@ from src.utils.telemetry import Telemetry
 class VideoClient:
     """
     Unified video generation client.
-    Platform router: motion-heavy -> Wan, cinematic -> Veo 3, fallback -> Kie.
-    Fallback chain: Veo 3 -> Wan -> Kie -> alert if all fail.
+    Platform router priority:
+      1. Veo 3 (cinematic quality)
+      2. Wan.video 2.2 (motion control)
+      3. Kie.ai (reliable fallback)
+    Waits for full video render before returning.
     """
 
     def __init__(
@@ -53,10 +60,11 @@ class VideoClient:
         output_dir: str = "media/staging",
     ) -> Optional[str]:
         """
-        Generate video using the platform router.
+        Generate video using the platform router with availability checks.
+        Waits for full render completion.
         Args:
             prompt: The video generation prompt.
-            motion_score: 0.0-1.0, higher means more motion (walking/dancing).
+            motion_score: 0.0-1.0, higher means more motion.
             cinematic_score: 0.0-1.0, higher means more cinematic quality.
             output_dir: Directory to save the output video.
         Returns:
@@ -68,7 +76,6 @@ class VideoClient:
         for platform in platform_order:
             platform_name = platform.__class__.__name__
             try:
-                # Health check before operation
                 healthy = await self._check_platform_health(platform_name)
                 if not healthy:
                     logger.warning(f"Skipping {platform_name}: health check failed.")
@@ -84,7 +91,6 @@ class VideoClient:
             except Exception as exc:
                 logger.error(f"Video generation failed on {platform_name}: {exc}")
 
-        # All platforms failed
         logger.error("All video generation platforms failed.")
         await self.telemetry.send_failure(
             "GENERATING_MEDIA",
@@ -99,19 +105,19 @@ class VideoClient:
     ) -> list:
         """
         Route to platforms based on content analysis scores.
-        - motion_score > 0.7 -> Wan.video first
+        Priority: Veo 3 > Wan.video > Kie.ai
         - cinematic_score > 0.7 -> Veo 3 first
-        - else -> Kie fallback first (most reliable)
-        Fallback chain always covers all three.
+        - motion_score > 0.7 -> Wan.video first
+        - else -> Veo 3 first (default best quality)
         """
-        if motion_score > 0.7:
-            return [self.wan, self.veo, self.kie]
         if cinematic_score > 0.7:
             return [self.veo, self.wan, self.kie]
+        if motion_score > 0.7:
+            return [self.wan, self.veo, self.kie]
         return [self.veo, self.wan, self.kie]
 
     async def _check_platform_health(self, platform_name: str) -> bool:
-        """Check platform health before video generation."""
+        """Check platform availability before video generation."""
         urls = {
             "VeoAdapter": "https://gemini.google.com",
             "WanAdapter": "https://www.wan.video",

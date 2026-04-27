@@ -8,7 +8,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+try:
+    from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+except Exception:  # pragma: no cover
+    from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from src.constants import FALLBACK_SELECTORS
 from src.engine.interaction_handler import InteractionHandler

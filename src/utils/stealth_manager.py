@@ -8,7 +8,10 @@ import os
 import random
 from typing import Any, Dict, List, Optional
 
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+try:
+    from patchright.async_api import Browser, BrowserContext, Page, async_playwright
+except Exception:  # pragma: no cover - fallback if patchright unavailable
+    from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from src.constants import (
     BROWSER_LAUNCH_ARGS,
