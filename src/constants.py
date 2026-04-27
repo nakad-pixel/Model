@@ -6,6 +6,11 @@ Configuration, Base DNA, fallback selectors, and timing intervals.
 from typing import List, Dict, Any
 
 # =============================================================================
+# DEFAULT PERSONA
+# =============================================================================
+DEFAULT_PERSONA_ID: str = "astra"
+
+# =============================================================================
 # PERSONA BASE DNA (MUST be included in every image generation prompt)
 # =============================================================================
 BASE_DNA_STRING: str = (
@@ -116,6 +121,12 @@ CONFIDENCE_THRESHOLD: int = 80             # GLM-4.7 confidence score minimum
 MAX_GENERATION_RETRIES: int = 2            # 3 attempts total (initial + 2 retries)
 MAX_CONSECUTIVE_FAILURES: int = 3          # Circuit breaker threshold
 E2E_TIMEOUT_SECONDS: int = 180
+
+# =============================================================================
+# VIDEO PLATFORM CONFIGURATION
+# =============================================================================
+VIDEO_RENDER_TIMEOUT_SECONDS: int = 300    # 5 minutes max wait for video render
+VIDEO_POLL_INTERVAL_SECONDS: int = 10
 
 # =============================================================================
 # STEALTH CONFIGURATION

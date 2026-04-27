@@ -1,0 +1,60 @@
+name: "Persona Orchestrator"
+description: "Runs the Astra orchestrator for a specific persona with full isolation"
+
+inputs:
+  persona-id:
+    description: "Persona ID to run (e.g., astra, nova)"
+    required: true
+    default: "astra"
+  python-version:
+    description: "Python version to use"
+    required: false
+    default: "3.11"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Setup Python"
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: "pip"
+
+    - name: "Install Python Dependencies"
+      shell: bash
+      run: pip install -r requirements.txt
+
+    - name: "Install Patchright Chromium"
+      shell: bash
+      run: python -m patchright install chromium
+
+    - name: "State Recovery: Fetch Previous Log"
+      uses: actions/download-artifact@v4
+      with:
+        name: astra-state-data-${{ inputs.persona-id }}
+        path: ./data/
+      continue-on-error: true
+
+    - name: "Execution: The Orchestrator"
+      shell: bash
+      env:
+        PERSONA_ID: ${{ inputs.persona-id }}
+        GEMINI_COOKIES_ASTRA: ${{ secrets.GEMINI_COOKIES_ASTRA }}
+        WAN_COOKIES_ASTRA: ${{ secrets.WAN_COOKIES_ASTRA }}
+        KIE_COOKIES_ASTRA: ${{ secrets.KIE_COOKIES_ASTRA }}
+        BUFFER_COOKIES_ASTRA: ${{ secrets.BUFFER_COOKIES_ASTRA }}
+        METRICOOL_COOKIES_ASTRA: ${{ secrets.METRICOOL_COOKIES_ASTRA }}
+        GLM_API_KEY_ASTRA: ${{ secrets.GLM_API_KEY_ASTRA }}
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      run: python -m src
+
+    - name: "Persistence: Upload State & Artifacts"
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: astra-state-data-${{ inputs.persona-id }}
+        path: |
+          data/
+          media/error_logs/
+          media/exports/
+        retention-days: 7

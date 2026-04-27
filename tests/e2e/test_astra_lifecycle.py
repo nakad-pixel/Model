@@ -153,6 +153,8 @@ class TestAstraLifecycle:
         states = [
             OrchestratorState.IDLE,
             OrchestratorState.INITIALIZING,
+            OrchestratorState.LOADING_PERSONA,
+            OrchestratorState.GENERATING_REFERENCE,
             OrchestratorState.GENERATING_MEDIA,
             OrchestratorState.VALIDATING,
             OrchestratorState.GENERATING_CAPTION,

@@ -8,7 +8,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import Page
+try:
+    from patchright.async_api import Page
+except Exception:  # pragma: no cover
+    from playwright.async_api import Page
 
 from src.engine.interaction_handler import InteractionHandler
 from src.utils.biometric_sim import BiometricSimulator
